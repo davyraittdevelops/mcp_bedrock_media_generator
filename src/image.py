@@ -2,7 +2,9 @@ import boto3
 import json
 import os
 import base64
-import io
+import asyncio
+from botocore.config import Config
+import logging
 
 # Import environment variables
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
@@ -10,7 +12,9 @@ MODEL_ID = "amazon.nova-canvas-v1:0"
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 
-async def create_image(prompt,negative_prompt, quality, width, height, seed_value):
+logger = logging.getLogger(__name__)
+
+async def create_image(prompt, negative_prompt, quality, width, height, seed_value):
     """
     Creates image using Amazon Nova Canvas model.
 
@@ -23,8 +27,20 @@ async def create_image(prompt,negative_prompt, quality, width, height, seed_valu
     :return: Base64 encoded image string
     """
 
-    # Initiate Bedrock Client
-    bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION, aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
+    # Create a new client with timeout configuration for each request
+    config = Config(
+        region_name=AWS_REGION,
+        read_timeout=60,
+        connect_timeout=10,
+        retries={'max_attempts': 3}
+    )
+
+    bedrock = boto3.client(
+        "bedrock-runtime",
+        config=config,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+    )
 
     # Set picture parameters
     model_input = json.dumps({
@@ -43,18 +59,33 @@ async def create_image(prompt,negative_prompt, quality, width, height, seed_valu
         }
     })
 
-    # Invoke model
-    response = bedrock.invoke_model(
-        body=model_input,
-        modelId=MODEL_ID,
-        accept="application/json",
-        contentType="application/json"
-    )
+    try:
+        logger.debug(f"Generating image with prompt: {prompt[:50]}...")
 
-    # Read the response body
-    response_body = json.loads(response.get("body").read())
+        # Run the blocking boto3 call in a thread pool to prevent blocking async loop
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: bedrock.invoke_model(
+                body=model_input,
+                modelId=MODEL_ID,
+                accept="application/json",
+                contentType="application/json"
+            )
+        )
 
-    # Extract and return the first image
-    base64_image = response_body.get("images")[0]
+        # Read the response body
+        response_body = json.loads(response.get("body").read())
 
-    return base64_image
+        # Extract and return the first image
+        base64_image = response_body.get("images")[0]
+
+        logger.debug("Image generated successfully")
+        return base64_image
+
+    except Exception as e:
+        logger.error(f"Error generating image: {e}")
+        raise
+    finally:
+        # Ensure client is properly closed
+        bedrock.close()
